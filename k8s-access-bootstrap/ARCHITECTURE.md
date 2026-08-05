@@ -1,34 +1,109 @@
-Architecture Concepts: Rake Console Launcher
-Companion to: Case Study: Making Kubernetes-Gated Support Operations Safe for Non-Kubernetes Engineers
+# Architecture Concepts: Kubernetes/AWS Access Setup Tool
 
-This document walks through how the tool is put together — the runtime flow, the individual mechanisms that make it safe to hand to a non-Kubernetes team, and the technical trade-offs behind each one. It intentionally describes patterns and shapes rather than the actual proprietary script, which belongs to Firstup.
+This document describes the tool's architecture at a conceptual level — the components, data flow, and design decisions — without reproducing the proprietary implementation. It's a companion to the [case study](./case-study-k8s-onboarding.md), written for anyone interested in *how* the tool is put together rather than just the problem it solves.
 
-System overview
-The tool is a single local bash script — no server component, no persistent service, nothing installed on the cluster. Everything it orchestrates is a thin layer over tools the engineer's machine already has: kubectl, the AWS CLI, and curl. That was a deliberate choice: introducing a new service to operate and secure would have been a disproportionate answer to "make an existing CLI workflow easier to run correctly."
+## Goals that shaped the design
 
+Before any component-level decisions, a few constraints drove almost everything else:
 
-Core components
-Region/cluster registry. A small set of parallel arrays mapping a human-readable region name to a kubectl context and an AWS SSO profile. Selecting a region does exactly two things — switches the local kubectl context and (optionally) triggers an SSO login — and nothing else in the script needs to know or care which region is active beyond that.
+- **Single file, no dependencies beyond what macOS/Homebrew already provides.** The audience is Support agents, not engineers — anything requiring a build step, a package install, or cloning a repo with dependencies was off the table. It had to be one script someone could download and run.
+- **Idempotent and safe to re-run.** Because the tool would be run repeatedly (daily re-authentication is a normal part of the underlying SSO setup), every step needed to be safe to run again without creating duplicate state, corrupting existing config, or requiring manual cleanup first.
+- **Fail loud and specific, not silent and generic.** Given the audience wouldn't have the context to debug a bare stack trace, every failure path needed to end in a plain-language explanation and a concrete next action — not just a nonzero exit code.
+- **Cheap for the common case, thorough for the first-time case.** First-time setup and "I need to re-authenticate today" are very different situations with very different acceptable costs — the architecture treats them differently rather than always paying the full cost.
 
-Task registry. Each task is defined by five aligned pieces of data: a plain-language name, a pod-name match pattern, a command template (with <PLACEHOLDER> tokens), an optional hint for follow-up steps inside a nested console, and an optional post-task alert. Keeping these as parallel arrays indexed by the same task number, rather than one richer data structure, was a pragmatic choice for a single-file bash script — it keeps every task's definition easy to scan and edit as a table, at the cost of needing to keep five arrays in sync by hand.
+## System context
 
-Pod discovery. Rather than hardcoding pod names (which include a random suffix and can change), the script greps the live output of kubectl get pods against each task's pattern. If more than one pod matches, the engineer gets a picker instead of the script guessing — a deliberate refusal to silently pick a pod when the match is ambiguous.
+The tool orchestrates four systems that don't otherwise know about each other:
 
-Command pre-fill. This is the piece that replaces "copy this command out of a wiki page" with something safer. The script generates a small helper script that uses bash's readline pre-fill (read -e -i) to place the real command — with placeholders — directly on an editable prompt inside the pod. That helper script is base64-encoded and written into the pod via a here-string rather than piped in, specifically so the interactive terminal isn't consumed by the transfer step and is still available for the engineer's own input afterward. The engineer sees the exact command, can edit it in place, and only ever presses Enter on something they can read in full — never a paste from a clipboard they didn't type into.
+```mermaid
+flowchart LR
+    User[Support agent's Mac]
+    Brew[Homebrew]
+    Wiki[Confluence page<br/>(dated config attachments)]
+    SSO[AWS IAM Identity Center]
+    EKS[EKS cluster API]
 
-Two-tier safety gate. Every task gets a preview and an explicit confirmation step before anything runs. Most tasks use a single "press Enter to continue" gate — enough friction to stop and read, not enough to make the tool annoying for routine work. The one task capable of permanently destroying data uses a second, stricter gate: a loud warning banner plus a requirement to type an exact phrase, not just press a key. The distinction is intentional — a single keypress is an appropriate gate for "read this and confirm," but not for "this cannot be undone."
+    User -- installs CLI tools via --> Brew
+    User -- fetches current config from --> Wiki
+    User -- authenticates via --> SSO
+    User -- verifies access to --> EKS
+    SSO -. issues short-lived credentials used by .-> EKS
+```
 
-Post-task alerts for out-of-scope steps. A small number of tasks have a second step that this tool deliberately does not automate (most notably, one that requires direct database write access). Rather than silently leaving that undone, the script prints an unmissable alert once the pod session ends, describing exactly what's still outstanding. This is the architectural answer to "how do you handle a task that's 90% safe to automate and 10% too risky to automate": automate the safe part, and make the unsafe part impossible to forget about rather than trying to make it safe.
+None of these four systems were designed to work together — the tool's entire job is being the thing that understands how they relate and sequences the handoffs between them correctly.
 
-Audit logging. Immediately before connecting (once the engineer has committed, not during preview, so a Ctrl+C cancel doesn't get logged as an attempt), the script sends a structured event — who, when, which cluster, which pod, which task — to a logging pipeline over HTTPS. This is intentionally best-effort and non-blocking: a failed or skipped log call never prevents the actual task from running. Audit visibility is a layer on top of the workflow, not a gate embedded in it, which matters because a logging outage should never become an operational outage.
+## Component breakdown
 
-Credential handling for the logging key. The audit key itself follows a simple, explicit priority order: an environment variable (for anyone who wants it in their shell profile) takes precedence over a locally cached file (scoped to that one machine, permissioned so only the owning user can read it), which takes precedence over an interactive prompt. Nothing is ever hardcoded into the script, and the masked input (character-by-character asterisks, with a last-four-characters confirmation) exists specifically so a bad paste is visible before it gets saved and silently breaks logging for weeks.
+**1. Argument parsing & versioning.** A minimal front door: recognizes a version flag, an explicit "force refresh" flag, and rejects anything else with a usage message. Kept deliberately small — this tool intentionally has almost no configuration surface, because every added flag is something a non-technical user has to understand.
 
-Two nested loops for session ergonomics. The runtime is structured as an outer loop (cluster selection + SSO login) wrapping an inner loop (task selection + execution). Re-running a task or switching back to the task list never leaves the inner loop; explicitly asking to switch region is the only thing that breaks back out to the outer loop, which re-prompts SSO. That structure maps directly onto the actual cost asymmetry in the underlying workflow — re-authenticating per region change is expected and cheap, but re-authenticating (or re-entering a credential) per task would not be — and the control flow was built around that asymmetry rather than around a generic "restart on any change" model.
+**2. Environment bootstrap.** Installs the handful of CLI tools the rest of the script depends on (a cloud CLI, a Kubernetes CLI, a couple of small JSON/YAML utilities) via the OS package manager, but only after installing the package manager itself if it's missing. This layer also contains a diagnostic subcomponent that checks whether the current process's effective architecture matches the machine's real hardware — necessary because a correctly-installed, correctly-native tool can still fail to execute if the terminal session itself is running under a compatibility/emulation layer. This check exists specifically because that failure mode produces an error message with no obvious connection to its actual cause.
 
-Notable technical decisions
-Using a here-string (base64 -d <<< '...') instead of a pipe to deliver the pre-fill helper script into the pod matters more than it looks: kubectl exec -it allocates an interactive TTY, and piping data into that command consumes the same stdin the engineer needs for their own subsequent input. The here-string sidesteps that entirely.
+**3. Credential acquisition.** An interactive layer that collects a work email and an API token for the wiki system, with three properties layered on top of "just read two strings": masked input that still gives feedback that *something* was typed (rather than a blank, ambiguous prompt), an offer to open the token-generation page directly in a browser, and a full bypass via environment variables so the same code path works unattended (e.g., for testing) as well as interactively.
 
-The menu-picker helper (pick_from_menu) explicitly checks whether read itself succeeded, not just whether the input was valid. Without that check, an exhausted input stream (EOF) causes an infinite "invalid choice, try again" loop instead of a clean exit — a failure mode that's easy to miss in interactive testing but shows up immediately under any kind of automated or piped testing.
+**4. Remote config retrieval.** The most involved component, structured as a small pipeline:
 
-The script uses set -euo pipefail throughout, which is why several helper functions build up output into local variables instead of using early-return patterns freely — under set -e, a nonzero-returning command in the wrong place will end the script, so control flow inside functions was written defensively with that in mind.
+```mermaid
+flowchart TD
+    A[List attachments on the wiki page via API] --> B[Filter to filenames matching expected pattern]
+    B --> C[Pick the one with the highest embedded date/number]
+    C --> D[Download it]
+    D --> E{Passes validation?}
+    E -- "leading BOM found" --> F[Strip it, continue]
+    E -- "duplicate config section" --> G[Keep last occurrence, drop earlier ones, warn]
+    E -- "looks like an HTML error page" --> H[Abort with a preview of what was downloaded]
+    F --> I[Write to local config path]
+    G --> I
+```
+
+The key architectural decision here is treating the wiki page as an **unreliable data source**, not a trusted file server. "Latest" is derived from parsing a date out of the filename itself (matching the actual convention in use) rather than trusting API metadata fields, and every downloaded file is validated for known failure shapes *before* being written to a location another tool will read from — because by the time a downstream tool like a CLI's config parser fails, the actual cause is several steps removed and much harder to diagnose.
+
+**5. Local state / caching layer.** Before attempting any of the above, the tool checks the modification time of the previously-downloaded config files. If they're recent enough, the entire credential-acquisition and remote-retrieval pipeline is skipped and the tool proceeds directly to session activation. This is what makes "re-authenticate today" cost seconds instead of minutes — the expensive, first-time-only work isn't repeated just because a *different*, cheap step (the SSO session) needs to happen again.
+
+**6. Context activation.** Switches the local Kubernetes CLI's active context and triggers the cloud CLI's SSO login flow for the relevant profile. Comparatively simple, but positioned deliberately *after* config retrieval so it always operates on a config file that's already been validated.
+
+**7. Verification.** A final check that access actually works, rather than ending the script the moment prior commands succeeded. This component went through the most iteration (see the [lessons learned](./lessons-learned.md) document) — its final form is intentionally the simplest version tried, after several more "sophisticated" versions failed to actually explain a real, reproducible discrepancy better than the simple one did.
+
+**8. Progress reporting.** A thin, cross-cutting layer — a step counter wrapping the components above — that exists purely for the human on the other end. Architecturally trivial; behaviorally one of the highest-leverage pieces, since it's what turns "an opaque wall of terminal output" into "a process with a visible beginning, middle, and end."
+
+## Data flow, end to end
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as Script
+    participant C as Confluence API
+    participant A as AWS SSO
+    participant K as EKS API
+
+    U->>S: run script
+    S->>S: check local config freshness
+    alt config is stale or missing
+        S->>U: prompt for credentials (or read from env)
+        S->>C: list + fetch current config attachments
+        C-->>S: config files
+        S->>S: validate + repair, write to disk
+    else config is fresh
+        S->>S: skip straight to next step
+    end
+    S->>S: activate kubectl context
+    S->>A: aws sso login
+    A-->>U: browser-based login flow
+    S->>K: verify access (kubectl get pods)
+    K-->>S: result
+    S->>U: done, or actionable error
+```
+
+## Design decisions worth calling out
+
+- **Plain shell over a "real" language.** Given the single-file, zero-dependency constraint and a target platform that always has a POSIX shell but not necessarily a specific language runtime, shell was the only choice that didn't add a dependency the tool would otherwise need to install first.
+- **Environment-variable overrides for every interactive prompt.** Every value the tool asks for interactively can also be supplied via environment variable. This wasn't for the primary audience — it's what made the tool's own components testable and reproducible during development, and it's a generally cheap pattern to build in from the start.
+- **Recoverable vs. fatal validation failures are handled differently on purpose.** A byte-order-mark is a benign, well-understood artifact — the tool fixes it silently. A duplicated configuration section indicates an actual mistake in the source data — the tool fixes it too (recovery still beats blocking someone's access), but *loudly*, because leaving that fixed silently would let a real documentation problem persist unnoticed. A response that looks like an HTML error page is treated as fully fatal, because there's no safe assumption to make about *why* it doesn't look like the expected file.
+- **The verification step's final architecture is the simplest one, not the most robust one.** Several more defensive versions were built and tested first. The lesson that shaped the final version — covered in more depth in the lessons-learned document — is that added robustness is only valuable if it's addressing the actual failure mode, and confirming that requires evidence, not just plausible-sounding theory.
+
+## Extensibility
+
+A few things this architecture makes straightforward to extend, if the tool's scope ever needed to grow:
+
+- **Additional regions/clusters:** the context-activation step is a thin, isolated layer — adding a second target is a matter of adding another activation call, not restructuring the pipeline.
+- **A different config source:** the retrieval pipeline's "list, filter, pick latest, download, validate" shape doesn't assume anything Confluence-specific except the API calls at the edges — swapping the source system means replacing those calls, not the pipeline logic.
+- **Non-interactive/CI use:** already supported via the environment-variable overrides, but a `--non-interactive` mode that fails fast instead of prompting would be a small, additive change.
