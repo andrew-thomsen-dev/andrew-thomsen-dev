@@ -1,30 +1,59 @@
-Lessons Learned: Rake Console Launcher
-Companion to: Case Study and Architecture Concepts
+# Lessons Learned: Building an Access Setup Tool for a Non-Technical Team
 
-This is a retrospective on how the tool actually got built — including the wrong turns, the assumptions that had to be corrected by the people actually using it, and the bugs that only showed up once the tool was pushed past a happy-path demo. Most of the real lessons here aren't about bash; they're about how a small internal tool's requirements only become fully clear once real users start pushing on it.
+This is a companion piece to the [case study](./case-study-k8s-onboarding.md) and [architecture concepts](./architecture-concepts.md) documents. Where those focus on the problem and the design, this one is about what the process of building and iterating on the tool actually taught — including the parts that didn't work the first time.
 
-The friction I optimized for wasn't the friction people actually had
-Partway through, a request came in to reduce how often the tool made people re-authenticate. My first instinct was to assume that meant AWS SSO login — that's the credential prompt that appears most often in a kubectl-based workflow, so it seemed like the obvious target. I restructured the loop so cluster selection and login happened once per session instead of once per task, and left it there.
+## 1. Rewrite the process before you automate it
 
-That was solving the wrong problem. The actual complaint was about re-entering the Datadog audit-logging API key, not the SSO login — and re-prompting for SSO on every region switch was explicitly fine with the team. The fix ended up being a locally cached, permissioned credential file for the audit key, which is a meaningfully different piece of engineering than what I'd built. The lesson wasn't "test more" — it was that when someone describes friction in a multi-step flow, don't assume which step it is; ask, or wait for the correction, before optimizing.
+The instinct when a manual process is painful is to jump straight to scripting it. The more valuable step happened before that: rewriting the underlying runbook itself, for its actual audience, before writing a single line of automation. Doing that first surfaced exactly which steps were genuinely necessary decisions a human had to make, versus steps that only felt necessary because the original documentation buried the actual logic in unrelated detail. Automating a bad process just makes the bad process faster. Clarifying it first is what made automating it straightforward.
 
-"Convenience" and "security concern" were about two different things
-Early on, the idea of a shared team alias came up purely as a UX convenience — one shortcut, less to remember. It took a teammate's infosec-minded pushback to separate that into two genuinely different questions: is the shell alias a problem (no — it's cosmetic, purely local, and doesn't touch identity at all), and is a shared credential/identity a problem (yes — that's what actually breaks individual accountability for a security review).
+## 2. Don't trust a shared document as if it were an API contract
 
-Once that distinction was clear, the real gap was easy to name precisely: standard Kubernetes audit logging captures that an exec happened and who initiated it, but not what was typed once inside an interactive shell. That's a narrower, more specific problem than "we need better logging," and it's what the Datadog audit event was actually built to close. The broader lesson: when a security concern is raised against a convenience feature, resist the urge to just make the convenience feature "more secure" — figure out which underlying capability is actually missing first.
+The tool depends on a wiki page maintained by hand, by multiple people, over time. Early on, it would have been easy to treat that page's attachments as clean, structured data. They weren't. Real revisions included an accidentally duplicated configuration section that broke a downstream tool's parser with an unhelpful generic error, and a byte-order-mark character — invisible in every normal way of inspecting the file — that broke parsing in a way that looked, to a human, like nothing was wrong at all.
 
-An edge case that only showed up once looping was added
-Adding the "run another task without restarting" loop introduced a subtle bug: the menu-picker function looped on invalid input by design, but it never checked whether read itself had failed — only whether the value it got back was a valid choice. Under normal interactive use that distinction never mattered. It only surfaced once the input stream could be exhausted mid-flow (in this case, during scripted testing with piped input), where it turned into a silent infinite loop instead of a clean failure. It was a good reminder that "loop until valid input" and "loop until any input" are different guarantees, and the difference only shows up under conditions a normal interactive session doesn't create.
+The lesson wasn't "fix those two specific things." It was: **any boundary where a human-maintained document becomes an input to automated tooling needs its own validation layer**, because the failure modes at that boundary are different from normal software bugs — they're data-quality problems that only show up when a person made an editing mistake, and they need to be caught and explained at the point of ingestion, not several steps later when a completely unrelated tool chokes on the result.
 
-Real user feedback beat my first guess at good-enough UX
-The first version of the API key prompt used a completely silent password-style read — nothing echoed back at all. That felt like the "secure" default. Feedback from an actual user was that it was genuinely hard to tell whether a paste had gone through at all, let alone correctly. The fix (asterisk-per-character masking, plus a last-four-characters confirmation after entry) is a small thing, but it only happened because someone using the tool said the silent version was confusing — my first pass at "secure-feeling" input didn't account for "confidence that something actually happened," which turned out to matter more in practice.
+## 3. Platform-specific failures need platform-specific understanding, not pattern matching
 
-Holding a security boundary even when it would have been easier not to
-At one point I was offered a real Datadog API key to hardcode directly into the script, and separately asked whether the same key could be reused inside a browser extension for click tracking. Both were reasonable-sounding shortcuts, and both were declined for related reasons: a key typed into a chat transcript or committed into a script destined for a shared repo is a key that's now exposed far beyond its intended use, and — confirmed by checking Datadog's own documentation rather than assuming — API keys are explicitly not meant to run in browser-side code at all, since anything shipped to a browser is inherently visible to whoever's using it. Neither of these was a hard technical constraint; both were "this would work, but it trades away a security property for convenience," which is exactly the kind of shortcut that's easiest to take under time pressure and hardest to walk back later.
+A cryptic low-level error (a binary refusing to execute at all) turned out to have nothing to do with the tool being installed incorrectly. It was caused by the terminal session itself running under an emulation layer for a different chip architecture than the machine actually had — a distinction that isn't visible from the error message at all, and that a first, reasonable-looking theory (guessing it was a leftover incompatible binary) didn't fully explain.
 
-Tooling failures need a decision point, not indefinite retries
-A GitHub connector needed for pushing the script to the team's repo reported as unavailable in every session, despite appearing connected in the user-facing settings UI — almost certainly a session-sync issue rather than a real configuration problem. It got rechecked more than once before landing on the right call: stop retrying the same broken path and explicitly hand the task back as a manual workaround. Tool or integration failures that don't resolve on a reasonable retry are a decision point ("route around this manually") rather than something to keep re-attempting hoping the next check behaves differently.
+Getting this right required actually understanding the mechanism — the difference between a machine's real hardware and the architecture a *specific running process* is currently emulating — rather than pattern-matching the error text to a plausible-sounding fix. The generalizable lesson: when a failure looks unrelated to the change that supposedly caused it, that's a signal to go find the actual mechanism, not to apply the most common fix for similar-looking symptoms.
 
-"No hardcoded secrets" and "safe to publish" are not the same bar
-The script was security-reviewed for credential handling from day one — no hardcoded keys, local-only caching, masked input — and that held up. But when the time came to actually put a copy in a personal public repo, a separate pass turned up direct links to internal documentation, a production admin URL, internal cluster/AWS naming conventions, and internal service codenames baked into the task list, none of which are "secrets" in the credential sense but all of which are internal, proprietary detail that had no business in a public repo. The lesson: a tool being credential-safe says nothing about whether it's safe to publish — those are two different reviews, and the second one only became obvious once publishing was actually on the table, not while the tool was being built for internal use.
+## 4. The most important debugging skill is knowing what you haven't ruled out yet
 
+The hardest bug in this project was a final verification step intermittently reporting "not found" for something confirmed to be running perfectly well, seconds later, by hand. Over several rounds, multiple plausible explanations were tested and each one legitimately made the check *more correct* in some way — and none of them changed the actual outcome:
+
+- **First theory:** the check couldn't tell a real connection failure from an empty result. True, and worth fixing on its own merits, but not the cause here — there was no connection failure.
+- **Second theory:** the check was only looking in the wrong location (a namespace-scoping gap). Also a real, worth-fixing gap in the code — but a direct side-by-side comparison showed the *exact same command*, run immediately after, succeeded without it.
+- **Third theory:** it was a timing issue immediately after a fresh authentication, so a short automatic retry was added. Better-targeted, but still didn't resolve it in practice.
+
+At that point, the right move wasn't a fourth increasingly-elaborate theory. It was stepping back, collecting direct evidence (the literal command the person could run themselves, the exact context configuration, the exact tool resolution) rather than more inference, and being willing to simplify the implementation back down to the exact, known-to-work manual command rather than keep layering cleverness on top of a mechanism that wasn't actually understood yet.
+
+**The lesson:** each fix attempt should be treated as a hypothesis with a falsifiable prediction, not a patch. If reality doesn't match the prediction, that's more valuable information than the fix itself — and it's a much stronger signal to slow down and gather direct evidence than to try a fifth variation on the same idea.
+
+## 5. Sometimes the correct fix is to remove sophistication, not add it
+
+Related to the above: the final version of the verification step is deliberately *less* defensive than an earlier version — it dropped a retry loop and a broader search scope that had both been added in good faith to fix the exact symptom being reported. Neither one turned out to be addressing the real mechanism, and both added complexity and runtime cost without a corresponding benefit. Reverting to the simplest possible version, matching exactly what was already confirmed to work by hand, was the right call — not because simple is always better, but because in this case the added logic had been shown, empirically, not to matter.
+
+It's worth being comfortable walking back a "fix" once the evidence says it isn't one, rather than defending it because it represents completed work.
+
+## 6. Small friction compounds heavily for a non-expert audience
+
+None of these individually sound like they'd matter much, but each one came directly from a real person's confusion or a real missed step:
+
+- A masked password-style input with *zero* visual feedback is indistinguishable, to someone unfamiliar with terminals, from a broken input field. Showing a character of feedback per keystroke (without revealing the actual value) removed that ambiguity.
+- A URL mentioned once in a paragraph, several screens of output earlier, is easy to miss entirely. Repeating it directly in the prompt where it's needed — and offering to just open it in a browser — removed the need to find it at all.
+- Unlabeled, continuous terminal output reads as one undifferentiated, possibly-broken process to someone who doesn't know what "normal" output is supposed to look like. Numbering the steps turned the same output into something with a visible beginning, middle, and end.
+
+None of these are hard engineering problems. They're the kind of thing that's easy to skip because they don't affect whether the tool *works* — but they heavily affect whether the intended audience is willing and able to use it at all, which was the entire point.
+
+## 7. Design explicitly for the repeat case, not just the first run
+
+The underlying authentication system this tool wraps requires re-authenticating roughly once a day — a permanent, ongoing cost, not a one-time setup step. Treating "I already did this once" as a first-class case (checking whether the expensive parts are still fresh before repeating them) turned a recurring daily cost into something that takes seconds. It's easy to design a tool around "the happy path of running it for the first time" and let every subsequent run pay the same cost as the first — worth explicitly asking, for anything meant to be run repeatedly, what the *second* run should cost, not just the first.
+
+## 8. A changelog that explains *why*, not just *what*, is worth the overhead
+
+Because this tool evolved through real, sometimes contradictory, user reports, keeping a running record of each change *and the reasoning behind it* — including the two changes that were later reverted — made it possible to avoid re-litigating settled questions, and made it much easier to reconstruct, later, why the current version looks the way it does. A changelog entry that just says "fixed pod check" is nearly worthless six iterations later; one that says what was tried, what evidence contradicted it, and what replaced it is what actually let the next round of debugging start from where the last one left off instead of from scratch.
+
+## Closing thought
+
+Nothing here was a single clever fix. It was a lot of ordinary decisions — validate untrusted input, understand mechanisms instead of pattern-matching symptoms, treat each fix as a testable claim, and take real user friction as seriously as real bugs — applied consistently, to a tool whose actual success metric was never "does the code run" but "will the person it's for actually use it."
